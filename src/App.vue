@@ -1,25 +1,9 @@
 <script setup>
 import { ref, reactive, onMounted, watch } from 'vue';
 
-const baseCanvas = ref(null);   // image + live effect
-const uiCanvas   = ref(null);   // overlay UI for divider / lasso
-const maskCanvas = ref(null);   // offscreen mask buffer (pixels = where to recolor)
+const baseCanvas = ref(null);   // image + recolored result
+const uiCanvas   = ref(null);   // selection rectangle + handles
 const fileInput  = ref(null);
-
-const SIDES = { LEFT: 'left', RIGHT: 'right' };
-
-/**
- * OPTIONAL: Pre-mapped mask (normalized 0..1 coordinates).
- * Replace this with your polygon for the zipper tape or any shape you want.
- * Example makes a rough vertical region on the left half.
- */
-const PRESET_MASK_NORMALIZED = [
-  // x, y are 0..1 relative to image width/height
-  { x: 0.12, y: 0.10 },
-  { x: 0.28, y: 0.10 },
-  { x: 0.30, y: 0.90 },
-  { x: 0.10, y: 0.90 },
-];
 
 const PALETTE = [
   { name: 'Red',    hex: '#e63946' },
@@ -34,42 +18,39 @@ const PALETTE = [
 ];
 
 const s = reactive({
+  // image
   img: null,
   natW: 0,
   natH: 0,
   dpr: Math.max(1, window.devicePixelRatio || 1),
   scale: 1,
-
-  // target color & strength
-  targetHex: '#4361ee',
-  targetHue: 0,        // 0..1
-  hueStrength: 150,    // 0..200 (%). >100 also boosts saturation
-
-  // half-split controls (fallback when no mask)
-  side: SIDES.LEFT,
-  splitX: 0,
-  draggingSplit: false,
-  dragHitPad: 8,
-  minSplit: 10,
-  maxSplit: 10,
-
-  // mask state
-  useMask: true,           // if true and maskPoints exist, mask takes priority
-  maskPoints: [],          // in canvas pixels
-  maskPointsNorm: [],      // normalized 0..1 (for persistence/resizing)
-  maskClosed: false,
-  drawingMask: false,      // when true, clicks add polygon points
-
-  // cached image
   originalImageData: null,
+
+  // target color
+  targetHex: '#4361ee',
+  targetHue: 0, // 0..1
+  targetSat: 1, // 0..1
+  targetLight: 0.5, // we probably won't use this, but keep it
+
+  // swatch rect (CSS pixels)
+  rect: { x: 60, y: 60, w: 160, h: 120 },
+
+  // dragging / resizing
+  dragging: false,
+  dragMode: null, // 'move' | 'nw' | 'ne' | 'se' | 'sw' | 'n' | 's' | 'e' | 'w'
+  dragStart: { x: 0, y: 0 },
+  rectStart: { x: 0, y: 0, w: 0, h: 0 },
+  handleSize: 8,
 });
 
-function pickFile() { fileInput.value?.click(); }
+function pickFile() {
+  fileInput.value?.click();
+}
+
 function onFile(e) {
-  const file = e.target.files?.[0];
-  if (!file) return;
-  const url = URL.createObjectURL(file);
-  loadImage(url);
+  const f = e.target.files?.[0];
+  if (!f) return;
+  loadImage(URL.createObjectURL(f));
 }
 
 function loadImage(src) {
@@ -79,17 +60,24 @@ function loadImage(src) {
     s.img = img;
     s.natW = img.naturalWidth;
     s.natH = img.naturalHeight;
+
     fitToCanvas();
     drawImage();
-    s.splitX = (baseCanvas.value.width / s.dpr) / 2;
-    s.maxSplit = (baseCanvas.value.width / s.dpr) - s.minSplit;
+
+    const cw = baseCanvas.value.width / s.dpr;
+    const ch = baseCanvas.value.height / s.dpr;
+    s.rect = {
+      x: Math.round(cw * 0.1),
+      y: Math.round(ch * 0.1),
+      w: Math.round(cw * 0.25),
+      h: Math.round(ch * 0.2),
+    };
+
+    // initial target color
     setTargetHex(s.targetHex, false);
 
-    // If you want the preset mask active by default:
-    setMaskFromNormalized(PRESET_MASK_NORMALIZED);
-
-    redrawUI();
-    applyRecolor();
+    applyRecolorInRect();
+    drawUI();
   };
   img.src = src;
 }
@@ -111,261 +99,257 @@ function fitToCanvas() {
     ctx.setTransform(s.dpr, 0, 0, s.dpr, 0, 0);
     ctx.imageSmoothingEnabled = true;
   }
-
-  // create/resize mask canvas (offscreen)
-  const m = document.createElement('canvas');
-  m.width = Math.floor(cw * s.dpr);
-  m.height = Math.floor(ch * s.dpr);
-  maskCanvas.value = m;
 }
 
 function drawImage() {
   const ctx = baseCanvas.value.getContext('2d');
   ctx.clearRect(0, 0, baseCanvas.value.width, baseCanvas.value.height);
   ctx.drawImage(s.img, 0, 0, s.natW * s.scale, s.natH * s.scale);
-  const full = ctx.getImageData(
-    0, 0,
+
+  s.originalImageData = ctx.getImageData(
+    0,
+    0,
     baseCanvas.value.width / s.dpr,
     baseCanvas.value.height / s.dpr
   );
-  s.originalImageData = full;
 }
 
-function redrawUI() {
+/* =========================
+   UI Overlay (selection)
+   ========================= */
+function drawUI() {
   const ctx = uiCanvas.value.getContext('2d');
   const W = uiCanvas.value.width / s.dpr;
   const H = uiCanvas.value.height / s.dpr;
   ctx.clearRect(0, 0, W, H);
 
-  // If mask exists, draw it
-  if (s.maskPoints.length) {
-    ctx.save();
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = s.drawingMask ? 'rgba(0,0,0,0.8)' : 'rgba(0,0,0,0.6)';
-    ctx.setLineDash([6, 4]);
-    ctx.beginPath();
-    ctx.moveTo(s.maskPoints[0].x, s.maskPoints[0].y);
-    for (let i = 1; i < s.maskPoints.length; i++) ctx.lineTo(s.maskPoints[i].x, s.maskPoints[i].y);
-    if (s.maskClosed) ctx.closePath();
-    ctx.stroke();
+  const { x, y, w, h } = s.rect;
 
-    ctx.setLineDash([2, 3]);
-    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
-    ctx.stroke();
+  // optional dim outside
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.12)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.clearRect(x, y, w, h);
+  ctx.restore();
 
-    // vertices
-    ctx.fillStyle = 'rgba(0,0,0,0.75)';
-    s.maskPoints.forEach(p => {
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, 2.5, 0, Math.PI * 2);
-      ctx.fill();
-    });
-    ctx.restore();
+  // border
+  ctx.save();
+  ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([5, 3]);
+  ctx.strokeRect(x + 0.5, y + 0.5, w, h);
+
+  ctx.setLineDash([]);
+  ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+  ctx.strokeRect(x + 0.5, y + 0.5, w, h);
+
+  // handles
+  ctx.fillStyle = 'rgba(0,0,0,0.85)';
+  for (const p of handlePoints(s.rect, s.handleSize)) {
+    ctx.fillRect(p.x, p.y, s.handleSize, s.handleSize);
   }
+  ctx.restore();
+}
 
-  // If no mask or useMask=false, show the split divider
-  if (!s.useMask || !s.maskClosed) {
-    const x = s.splitX;
-    ctx.save();
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = 'rgba(0,0,0,0.7)';
-    ctx.beginPath();
-    ctx.moveTo(x + 0.5, 0);
-    ctx.lineTo(x + 0.5, H);
-    ctx.stroke();
+function handlePoints(rect, size) {
+  const { x, y, w, h } = rect;
+  const hs = size;
+  const midX = x + w / 2 - hs / 2;
+  const midY = y + h / 2 - hs / 2;
+  return [
+    { x: x - hs / 2,     y: y - hs / 2,     mode: 'nw', cursor: 'nwse-resize' },
+    { x: x + w - hs / 2, y: y - hs / 2,     mode: 'ne', cursor: 'nesw-resize' },
+    { x: x + w - hs / 2, y: y + h - hs / 2, mode: 'se', cursor: 'nwse-resize' },
+    { x: x - hs / 2,     y: y + h - hs / 2, mode: 'sw', cursor: 'nesw-resize' },
+    { x: midX,           y: y - hs / 2,     mode: 'n',  cursor: 'ns-resize'   },
+    { x: midX,           y: y + h - hs / 2, mode: 's',  cursor: 'ns-resize'   },
+    { x: x - hs / 2,     y: midY,           mode: 'w',  cursor: 'ew-resize'   },
+    { x: x + w - hs / 2, y: midY,           mode: 'e',  cursor: 'ew-resize'   },
+  ];
+}
 
-    ctx.setLineDash([4, 3]);
-    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
-    ctx.beginPath();
-    ctx.moveTo(x - 1.5, 0);
-    ctx.lineTo(x - 1.5, H);
-    ctx.stroke();
-
-    ctx.fillStyle = 'rgba(0,0,0,0.8)';
-    ctx.fillRect(x - 5, H / 2 - 16, 10, 32);
-    ctx.restore();
+function hitTest(x, y) {
+  // handles first
+  for (const h of handlePoints(s.rect, s.handleSize)) {
+    if (
+      x >= h.x &&
+      x <= h.x + s.handleSize &&
+      y >= h.y &&
+      y <= h.y + s.handleSize
+    ) {
+      return h.mode;
+    }
   }
+  // inside rect?
+  const { x: rx, y: ry, w, h } = s.rect;
+  if (x >= rx && x <= rx + w && y >= ry && y <= ry + h) return 'move';
+  return null;
 }
 
-/* =========================
-   Mask: preset & draw modes
-   ========================= */
-function setMaskFromNormalized(pointsNorm) {
-  if (!pointsNorm || !pointsNorm.length) {
-    clearMask();
-    return;
-  }
-  const W = uiCanvas.value.width / s.dpr;
-  const H = uiCanvas.value.height / s.dpr;
-  s.maskPoints = pointsNorm.map(p => ({ x: p.x * W, y: p.y * H }));
-  s.maskPointsNorm = JSON.parse(JSON.stringify(pointsNorm));
-  s.maskClosed = true;
-  s.drawingMask = false;
-  rasterizeMask(); // draw to maskCanvas
-}
-
-function clearMask() {
-  s.maskPoints = [];
-  s.maskPointsNorm = [];
-  s.maskClosed = false;
-  s.drawingMask = false;
-  const mctx = maskCanvas.value.getContext('2d');
-  mctx.clearRect(0, 0, maskCanvas.value.width, maskCanvas.value.height);
-}
-
-function startDrawingMask() {
-  s.drawingMask = true;
-  s.maskPoints = [];
-  s.maskPointsNorm = [];
-  s.maskClosed = false;
-  redrawUI();
-}
-
-function closeMask() {
-  if (s.maskPoints.length >= 3) {
-    s.maskClosed = true;
-    s.drawingMask = false;
-    // save normalized coords for persistence across resize
-    const W = uiCanvas.value.width / s.dpr;
-    const H = uiCanvas.value.height / s.dpr;
-    s.maskPointsNorm = s.maskPoints.map(p => ({ x: p.x / W, y: p.y / H }));
-    rasterizeMask();
-    redrawUI();
-    applyRecolor();
-  }
-}
-
-function rasterizeMask() {
-  const mctx = maskCanvas.value.getContext('2d');
-  const W = maskCanvas.value.width / s.dpr;
-  const H = maskCanvas.value.height / s.dpr;
-  mctx.setTransform(s.dpr, 0, 0, s.dpr, 0, 0);
-  mctx.clearRect(0, 0, W, H);
-  if (!s.maskPoints.length || !s.maskClosed) return;
-  mctx.save();
-  mctx.beginPath();
-  mctx.moveTo(s.maskPoints[0].x, s.maskPoints[0].y);
-  for (let i = 1; i < s.maskPoints.length; i++) mctx.lineTo(s.maskPoints[i].x, s.maskPoints[i].y);
-  mctx.closePath();
-  mctx.fillStyle = 'rgba(255,255,255,1)'; // white = inside mask
-  mctx.fill();
-  mctx.restore();
-}
-
-/* =========================
-   UI Handlers
-   ========================= */
-function onSideChange(e) {
-  s.side = e.target.value;
-  applyRecolor();
-  redrawUI();
-}
-function onSplitSlider(e) {
-  s.splitX = Number(e.target.value);
-  applyRecolor();
-  redrawUI();
-}
-function onStrengthInput(e) {
-  s.hueStrength = Number(e.target.value);
-  applyRecolor();
-}
-function toggleUseMask(e) {
-  s.useMask = e.target.checked;
-  applyRecolor();
-  redrawUI();
-}
 function onCanvasDown(ev) {
   const { x, y } = getMouse(ev);
+  const hit = hitTest(x, y);
+  if (!hit) return;
 
-  // If we're drawing a mask, clicks add points
-  if (s.drawingMask) {
-    if (!s.maskPoints.length) {
-      s.maskPoints.push({ x, y });
-    } else {
-      // If near first point and we already have >=2 points, close on click
-      const first = s.maskPoints[0];
-      const dx = x - first.x, dy = y - first.y;
-      if (Math.hypot(dx, dy) < 10 && s.maskPoints.length >= 3) {
-        closeMask();
-        return;
-      }
-      s.maskPoints.push({ x, y });
-    }
-    redrawUI();
-    return;
-  }
-
-  // Otherwise, allow dragging the split if mask is not active/closed
-  if (!s.useMask || !s.maskClosed) {
-    if (Math.abs(x - s.splitX) <= s.dragHitPad) s.draggingSplit = true;
-  }
+  s.dragging = true;
+  s.dragMode = hit;
+  s.dragStart = { x, y };
+  s.rectStart = { ...s.rect };
 }
+
 function onCanvasMove(ev) {
-  const { x } = getMouse(ev);
+  const { x, y } = getMouse(ev);
+  const hit = hitTest(x, y);
+  uiCanvas.value.style.cursor = cursorForMode(hit);
 
-  if (s.drawingMask) {
-    // visual aid only; we draw static points; no preview line needed
-    return;
+  if (!s.dragging) return;
+
+  const dx = x - s.dragStart.x;
+  const dy = y - s.dragStart.y;
+
+  let { x: rx, y: ry, w, h } = s.rectStart;
+
+  switch (s.dragMode) {
+    case 'move':
+      rx += dx;
+      ry += dy;
+      break;
+    case 'nw':
+      rx += dx;
+      ry += dy;
+      w -= dx;
+      h -= dy;
+      break;
+    case 'ne':
+      ry += dy;
+      w += dx;
+      h -= dy;
+      break;
+    case 'se':
+      w += dx;
+      h += dy;
+      break;
+    case 'sw':
+      rx += dx;
+      w -= dx;
+      h += dy;
+      break;
+    case 'n':
+      ry += dy;
+      h -= dy;
+      break;
+    case 's':
+      h += dy;
+      break;
+    case 'e':
+      w += dx;
+      break;
+    case 'w':
+      rx += dx;
+      w -= dx;
+      break;
   }
 
-  if (!s.useMask || !s.maskClosed) {
-    uiCanvas.value.style.cursor = Math.abs(x - s.splitX) <= s.dragHitPad ? 'col-resize' : 'default';
-    if (!s.draggingSplit) return;
-    const W = baseCanvas.value.width / s.dpr;
-    s.splitX = clamp(x, s.minSplit, W - s.minSplit);
-    applyRecolor();
-    redrawUI();
+  // normalize negative sizes
+  if (w < 1) {
+    rx = rx + w;
+    w = Math.abs(w);
   }
+  if (h < 1) {
+    ry = ry + h;
+    h = Math.abs(h);
+  }
+
+  // constrain to canvas
+  const W = baseCanvas.value.width / s.dpr;
+  const H = baseCanvas.value.height / s.dpr;
+  rx = Math.max(0, Math.min(W - w, rx));
+  ry = Math.max(0, Math.min(H - h, ry));
+
+  s.rect = {
+    x: Math.round(rx),
+    y: Math.round(ry),
+    w: Math.round(w),
+    h: Math.round(h),
+  };
+
+  applyRecolorInRect();
+  drawUI();
 }
-function onCanvasUp() { s.draggingSplit = false; }
-function onCanvasDblClick() {
-  if (s.drawingMask) closeMask();
+
+function onCanvasUp() {
+  s.dragging = false;
+  s.dragMode = null;
 }
 
-function onKeydown(e) {
-  if (e.key === 'Escape') {
-    if (s.drawingMask) {
-      s.drawingMask = false;
-      s.maskPoints = [];
-      s.maskClosed = false;
-      redrawUI();
-    }
-  }
-  if ((e.key === 'Enter' || e.key === 'Return') && s.drawingMask) {
-    closeMask();
+function cursorForMode(mode) {
+  switch (mode) {
+    case 'move':
+      return 'move';
+    case 'nw':
+    case 'se':
+      return 'nwse-resize';
+    case 'ne':
+    case 'sw':
+      return 'nesw-resize';
+    case 'n':
+    case 's':
+      return 'ns-resize';
+    case 'e':
+    case 'w':
+      return 'ew-resize';
+    default:
+      return 'default';
   }
 }
 
 function getMouse(e) {
-  const rect = uiCanvas.value.getBoundingClientRect();
-  return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  const r = uiCanvas.value.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
 }
 
 /* =========================
-   Color & Recolor
+   Color helpers
    ========================= */
 function hexToRgb(hex) {
   const m = /^#?([A-Fa-f0-9]{6})$/.exec(hex);
   if (!m) return null;
-  const intVal = parseInt(m[1], 16);
-  return { r: (intVal >> 16) & 255, g: (intVal >> 8) & 255, b: intVal & 255 };
+  const v = parseInt(m[1], 16);
+  return {
+    r: (v >> 16) & 255,
+    g: (v >> 8) & 255,
+    b: v & 255,
+  };
 }
+
 function rgbToHsl(r, g, b) {
-  r /= 255; g /= 255; b /= 255;
-  const max = Math.max(r, g, b), min = Math.min(r, g, b);
-  let h = 0, s_ = 0, l = (max + min) / 2;
+  r /= 255;
+  g /= 255;
+  b /= 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  let h = 0,
+    s_ = 0;
+  const l = (max + min) / 2;
   const d = max - min;
   if (d !== 0) {
     s_ = l > 0.5 ? d / (2 - max - min) : d / (max + min);
     switch (max) {
-      case r: h = (g - b) / d + (g < b ? 6 : 0); break;
-      case g: h = (b - r) / d + 2; break;
-      case b: h = (r - g) / d + 4; break;
+      case r:
+        h = (g - b) / d + (g < b ? 6 : 0);
+        break;
+      case g:
+        h = (b - r) / d + 2;
+        break;
+      case b:
+        h = (r - g) / d + 4;
+        break;
     }
     h /= 6;
   }
   return [h, s_, l];
 }
+
 function hslToRgb(h, s_, l) {
   let r, g, b;
   if (s_ === 0) {
@@ -374,215 +358,152 @@ function hslToRgb(h, s_, l) {
     const hue2rgb = (p, q, t) => {
       if (t < 0) t += 1;
       if (t > 1) t -= 1;
-      if (t < 1/6) return p + (q - p) * 6 * t;
-      if (t < 1/2) return q;
-      if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+      if (t < 1 / 6) return p + (q - p) * 6 * t;
+      if (t < 1 / 2) return q;
+      if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
       return p;
     };
     const q = l < 0.5 ? l * (1 + s_) : l + s_ - l * s_;
     const p = 2 * l - q;
-    r = hue2rgb(p, q, h + 1/3);
+    r = hue2rgb(p, q, h + 1 / 3);
     g = hue2rgb(p, q, h);
-    b = hue2rgb(p, q, h - 1/3);
+    b = hue2rgb(p, q, h - 1 / 3);
   }
   return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
 }
+
+/**
+ * Set the target color, and cache its HSL so we can map
+ * pixels to that color while keeping their own lightness.
+ */
 function setTargetHex(hex, reapply = true) {
   const rgb = hexToRgb(hex);
   if (!rgb) return;
-  const [h] = rgbToHsl(rgb.r, rgb.g, rgb.b);
-  s.targetHex = hex;
+  const [h, s_, l] = rgbToHsl(rgb.r, rgb.g, rgb.b);
+
+  s.targetHex = hex.toUpperCase();
   s.targetHue = h;
-  if (reapply) applyRecolor();
+  s.targetSat = s_;
+  s.targetLight = l;
+
+  if (reapply) applyRecolorInRect();
 }
+
 function onHexInput(e) {
   const val = e.target.value.trim();
   const norm = val.startsWith('#') ? val : `#${val}`;
-  if (/^#([A-Fa-f0-9]{6})$/.test(norm)) setTargetHex(norm);
-}
-function pickPreset(hex) { setTargetHex(hex); }
-function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
-function wrap01(x) { x = x % 1; return x < 0 ? x + 1 : x; }
-function clamp01(v) { return Math.max(0, Math.min(1, v)); }
-function lerpHue(h0, h1, t) {
-  let dh = h1 - h0;
-  if (dh > 0.5) dh -= 1;
-  if (dh < -0.5) dh += 1;
-  return wrap01(h0 + dh * t);
+  if (/^#([A-Fa-f0-9]{6})$/.test(norm)) {
+    setTargetHex(norm);
+  }
 }
 
-/* Core recolor:
-   - If useMask && maskClosed: apply only where mask alpha > 0
-   - Else: apply to selected half (left/right of split)
-*/
-function applyRecolor() {
-  if (!s.img || !s.originalImageData) return;
-  const ctx = baseCanvas.value.getContext('2d');
-  ctx.putImageData(s.originalImageData, 0, 0);
-
-  const W = baseCanvas.value.width / s.dpr;
-  const H = baseCanvas.value.height / s.dpr;
-
-  const useMaskNow = s.useMask && s.maskClosed && s.maskPoints.length;
-
-  // Region to process: for mask, use its bounding box; otherwise the chosen half
-  let region = { x: 0, y: 0, w: W, h: H };
-  let maskData = null;
-
-  if (useMaskNow) {
-    const bb = boundsOfPoints(s.maskPoints);
-    region = {
-      x: Math.max(0, Math.floor(bb.minX)),
-      y: Math.max(0, Math.floor(bb.minY)),
-      w: Math.max(0, Math.ceil(bb.maxX) - Math.floor(bb.minX)),
-      h: Math.max(0, Math.ceil(bb.maxY) - Math.floor(bb.minY)),
-    };
-    // get mask alpha (same DPI/scaling)
-    const mctx = maskCanvas.value.getContext('2d');
-    const maskImg = mctx.getImageData(region.x, region.y, region.w, region.h);
-    maskData = maskImg.data; // use alpha to gate recolor
-  } else {
-    const leftRegion  = { x: 0, y: 0, w: Math.floor(s.splitX), h: H };
-    const rightRegion = { x: Math.floor(s.splitX), y: 0, w: W - Math.floor(s.splitX), h: H };
-    region = (s.side === SIDES.LEFT) ? leftRegion : rightRegion;
-    if (region.w <= 0 || region.h <= 0) return;
-  }
-
-  const imgData = ctx.getImageData(region.x, region.y, region.w, region.h);
-  const data = imgData.data;
-  const targetHue = s.targetHue;
-
-  const tHue  = Math.min(1, Math.max(0, s.hueStrength / 100));
-  const extra = Math.min(1, Math.max(0, (s.hueStrength - 100) / 100));
-
-  for (let j = 0; j < region.h; j++) {
-    for (let i = 0; i < region.w; i++) {
-      const idx = (j * region.w + i) * 4;
-      const a = data[idx + 3];
-      if (a === 0) continue;
-
-      // If masking, skip pixels outside polygon
-      if (useMaskNow) {
-        const ma = maskData[idx + 3]; // alpha from mask
-        if (ma === 0) continue;
-      }
-
-      const r = data[idx], g = data[idx + 1], b = data[idx + 2];
-      let [h0, s0, l0] = rgbToHsl(r, g, b);
-
-      const h1 = (tHue < 1) ? lerpHue(h0, targetHue, tHue) : targetHue;
-      const s1 = (extra > 0) ? clamp01(s0 + (1 - s0) * extra) : s0;
-
-      const [rr, gg, bb] = hslToRgb(h1, s1, l0);
-      data[idx]     = rr;
-      data[idx + 1] = gg;
-      data[idx + 2] = bb;
-    }
-  }
-
-  ctx.putImageData(imgData, region.x, region.y);
-}
-
-function boundsOfPoints(pts) {
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const p of pts) {
-    if (p.x < minX) minX = p.x;
-    if (p.y < minY) minY = p.y;
-    if (p.x > maxX) maxX = p.x;
-    if (p.y > maxY) maxY = p.y;
-  }
-  return { minX, minY, maxX, maxY };
+function pickPreset(hex) {
+  setTargetHex(hex);
 }
 
 /* =========================
-   Lifecycle / Watchers
+   Core recolor in swatch
+   ========================= */
+/**
+ * Recolors ONLY the swatch rect by:
+ *   - Converting pixel to HSL
+ *   - Using target Hue & Saturation
+ *   - Keeping original Lightness
+ *
+ * So you get full color replacement, but the original
+ * brightness/texture stays, which makes it seamless.
+ */
+function applyRecolorInRect() {
+  if (!s.img || !s.originalImageData) return;
+
+  const ctx = baseCanvas.value.getContext('2d');
+  // restore full original frame
+  ctx.putImageData(s.originalImageData, 0, 0);
+
+  const { x, y, w, h } = s.rect;
+  if (w <= 0 || h <= 0) return;
+
+  const imgData = ctx.getImageData(x, y, w, h);
+  const data = imgData.data;
+  const targetH = s.targetHue;
+  const targetS = s.targetSat;
+
+  for (let i = 0; i < data.length; i += 4) {
+    const a = data[i + 3];
+    if (a === 0) continue; // ignore fully transparent pixels
+
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+
+    const [h0, s0, l0] = rgbToHsl(r, g, b);
+
+    // full color replacement:
+    //   - completely override Hue with targetH
+    //   - completely override Saturation with targetS
+    //   - keep original Lightness l0 (shading/texture)
+    const [rr, gg, bb] = hslToRgb(targetH, targetS, l0);
+
+    data[i] = rr;
+    data[i + 1] = gg;
+    data[i + 2] = bb;
+    // alpha unchanged
+  }
+
+  ctx.putImageData(imgData, x, y);
+}
+
+/* =========================
+   Lifecycle
    ========================= */
 onMounted(() => {
-  loadImage('/zipper.jpg'); // default
-  window.addEventListener('keydown', onKeydown);
+  setTargetHex(s.targetHex, false);
+  loadImage('/zipper.jpg'); // default image in public/
+
   window.addEventListener('resize', () => {
     if (!s.img) return;
+
     const saved = {
-      splitX: s.splitX,
-      side: s.side,
+      rect: { ...s.rect },
       targetHex: s.targetHex,
-      hueStrength: s.hueStrength,
-      useMask: s.useMask,
-      maskNorm: s.maskPointsNorm ? JSON.parse(JSON.stringify(s.maskPointsNorm)) : [],
     };
+
     fitToCanvas();
     drawImage();
 
     const W = baseCanvas.value.width / s.dpr;
-    s.splitX = clamp(saved.splitX, s.minSplit, W - s.minSplit);
-    s.side = saved.side;
+    const H = baseCanvas.value.height / s.dpr;
+
+    let { x, y, w, h } = saved.rect;
+    if (w > W) w = W;
+    if (h > H) h = H;
+    x = Math.max(0, Math.min(W - w, x));
+    y = Math.max(0, Math.min(H - h, y));
+
+    s.rect = { x, y, w, h };
+
     setTargetHex(saved.targetHex, false);
-    s.hueStrength = saved.hueStrength;
-    s.maxSplit = W - s.minSplit;
-    s.useMask = saved.useMask;
-
-    if (saved.maskNorm && saved.maskNorm.length) {
-      setMaskFromNormalized(saved.maskNorm);
-    } else {
-      clearMask();
-    }
-
-    redrawUI();
-    applyRecolor();
+    applyRecolorInRect();
+    drawUI();
   });
 });
 
-watch(() => s.side, applyRecolor);
-watch(() => s.targetHex, applyRecolor);
-watch(() => s.hueStrength, applyRecolor);
-watch(() => s.useMask, applyRecolor);
+watch(() => s.targetHex, applyRecolorInRect);
 </script>
 
 <template>
   <div style="padding:16px; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;">
-    <h2 style="margin:0 0 12px;">Selective Recolor: Preset Mask or Drawn Mask (falls back to Half Split)</h2>
+    <h2 style="margin:0 0 12px;">Swatch Recolor (True Color Swap with Shading)</h2>
 
     <div style="display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-bottom:12px;">
-      <input ref="fileInput" type="file" accept="image/png,image/jpeg" @change="onFile" style="display:none" />
+      <input
+        ref="fileInput"
+        type="file"
+        accept="image/png,image/jpeg"
+        @change="onFile"
+        style="display:none"
+      />
       <button @click="pickFile">Load Image (PNG/JPG)</button>
-
-      <label style="display:flex; align-items:center; gap:8px;">
-        <span>Hue Strength</span>
-        <input type="range" min="0" max="200" step="1" :value="s.hueStrength" @input="onStrengthInput" />
-        <span style="width:42px; text-align:right;">{{ s.hueStrength }}%</span>
-      </label>
-
-      <label style="display:flex; align-items:center; gap:8px;">
-        <input type="checkbox" :checked="s.useMask" @change="toggleUseMask" />
-        <span>Use Mask (if available)</span>
-      </label>
-
-      <button @click="startDrawingMask">Draw Mask</button>
-      <button @click="clearMask" :disabled="!s.maskPoints.length">Clear Mask</button>
-
-      <label style="display:flex; align-items:center; gap:6px;">
-        <span>Side</span>
-        <select :value="s.side" @change="onSideChange" :disabled="s.useMask && s.maskClosed">
-          <option :value="`left`">Left side recolored</option>
-          <option :value="`right`">Right side recolored</option>
-        </select>
-      </label>
-
-      <div style="display:flex; align-items:center; gap:8px; white-space:nowrap;" v-if="!s.useMask || !s.maskClosed">
-        <span>Split</span>
-        <input
-          type="range"
-          :min="s.minSplit"
-          :max="s.maxSplit"
-          step="1"
-          :value="s.splitX"
-          @input="onSplitSlider"
-          style="width:200px;"
-        />
-        <span style="width:44px; text-align:right;">{{ Math.round(s.splitX) }}px</span>
-      </div>
-
-      <div style="height:1px; background:#e3e3e3; width:100%;"></div>
 
       <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
         <span style="margin-right:4px;">Quick colors:</span>
@@ -592,8 +513,13 @@ watch(() => s.useMask, applyRecolor);
           @click="pickPreset(c.hex)"
           :title="c.name"
           :style="{
-            width:'28px', height:'28px', border:'1px solid #bbb', borderRadius:'6px',
-            background:c.hex, outline: s.targetHex.toLowerCase() === c.hex.toLowerCase() ? '2px solid #333' : 'none'
+            width:'28px', height:'28px',
+            border:'1px solid #bbb',
+            borderRadius:'6px',
+            background:c.hex,
+            outline: s.targetHex.toLowerCase() === c.hex.toLowerCase()
+              ? '2px solid #333'
+              : 'none'
           }"
         />
         <label style="display:flex; align-items:center; gap:6px; margin-left:6px;">
@@ -607,23 +533,21 @@ watch(() => s.useMask, applyRecolor);
           />
         </label>
       </div>
+
+      <span style="color:#666;">Drag the rectangle to move; drag the handles to resize the recolor swatch.</span>
     </div>
 
     <div style="position:relative; display:inline-block; border:1px solid #ddd; background:#f6f6f6;">
       <canvas ref="baseCanvas"></canvas>
-      <canvas ref="uiCanvas"
-              style="position:absolute; left:0; top:0; cursor:crosshair;"
-              @mousedown="onCanvasDown"
-              @mousemove="onCanvasMove"
-              @mouseup="onCanvasUp"
-              @mouseleave="onCanvasUp"
-              @dblclick="onCanvasDblClick"></canvas>
+      <canvas
+        ref="uiCanvas"
+        style="position:absolute; left:0; top:0;"
+        @mousedown="onCanvasDown"
+        @mousemove="onCanvasMove"
+        @mouseup="onCanvasUp"
+        @mouseleave="onCanvasUp"
+      ></canvas>
     </div>
-
-    <p style="color:#555; margin-top:8px;">
-      Mask drawing: Click to add points around your area. Double-click or press Enter to close.  
-      When a mask is closed and “Use Mask” is checked, recolor applies only inside the mask.
-    </p>
   </div>
 </template>
 
@@ -635,5 +559,7 @@ button {
   background: #fff;
   cursor: pointer;
 }
-select, input[type="range"], input[type="text"] { cursor: pointer; }
+input[type='text'] {
+  cursor: text;
+}
 </style>
